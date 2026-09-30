@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-BTC/USDT MARKET SIMULATION LAB
-==============================
-Replay real Binance candles + practice direction prediction.
+BTC/USDT LIVE MARKET SIMULATION
+===============================
+Real-time practice terminal.
+Predict UP / DOWN / FLAT on live BTC/USDT candles, wait for
+reality to settle on its own, and track your accuracy honestly.
 
-Features:
-- Real data from Binance (CSV upload or live API fetch).
-- Future candles hidden until you lock a prediction.
-- Honest scoring: compared against random and majority baselines.
-- Multi-host fallback to bypass geo-blocking on cloud servers.
+- Data pulled live from Binance (multi-host fallback).
+- Predictions anchored to the last CLOSED candle, so the
+  reference price does not drift while you wait.
+- Settlement uses Binance server time, not your laptop's clock.
+- Auto-refresh follows the live market.
 
 This is a TRAINING tool, NOT a trading signal.
-Accuracy here does NOT account for fees, spread, slippage,
-or payout — it is not a profit simulation.
+Accuracy here does NOT account for fees, spread, slippage, or payout.
 
 Run:
-    streamlit run btc_sim_streamlit.py
+    streamlit run btc_live_sim_streamlit.py
 """
 
-import io
 import time
+import uuid
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 
 # =========================================================
@@ -34,15 +37,13 @@ import streamlit as st
 # =========================================================
 
 st.set_page_config(
-    page_title="BTC/USDT Simulation Lab",
-    page_icon="📊",
+    page_title="BTC/USDT Live Simulation",
+    page_icon="🟢",
     layout="wide",
 )
 
 MINUTE_MS = 60_000
 
-# Tried in order. data-api.binance.vision serves public market
-# data and usually bypasses geo-blocking on cloud servers.
 BINANCE_HOSTS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -61,85 +62,34 @@ KLINE_COLUMNS = [
 
 
 # =========================================================
-# DATA UTILITIES
+# TIME HELPERS
 # =========================================================
 
-def validate_ohlcv(df):
+def utc_str(ms):
+    return datetime.fromtimestamp(
+        ms / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def utc_short(ms):
+    return datetime.fromtimestamp(
+        ms / 1000, tz=timezone.utc
+    ).strftime("%H:%M:%S")
+
+
+def interval_to_ms(interval):
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(interval[:-1]) * units[interval[-1]]
+
+
+# =========================================================
+# BINANCE API (with multi-host fallback)
+# =========================================================
+
+def fetch_klines(symbol, interval, limit):
     """
-    Validate and normalize OHLCV data.
-    Accepts open_time in ms, seconds, or datetime string.
-    Returns: (clean dataframe, gap count)
-    """
-    required = ["open_time", "open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
-    d = df.copy()
-
-    # Normalize open_time to milliseconds
-    if not np.issubdtype(d["open_time"].dtype, np.number):
-        d["open_time"] = (
-            pd.to_datetime(d["open_time"], utc=True)
-            .astype("int64") // 1_000_000
-        )
-    else:
-        d["open_time"] = pd.to_numeric(
-            d["open_time"], errors="raise"
-        ).astype("int64")
-        # If values look like seconds, convert to ms
-        if d["open_time"].max() < 100_000_000_000:
-            d["open_time"] *= 1000
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        d[col] = pd.to_numeric(d[col], errors="raise").astype(float)
-
-    if "taker_buy_vol" in d.columns:
-        d["taker_buy_vol"] = pd.to_numeric(
-            d["taker_buy_vol"], errors="coerce"
-        ).astype(float)
-    else:
-        d["taker_buy_vol"] = np.nan
-
-    d = (
-        d.sort_values("open_time")
-        .drop_duplicates("open_time")
-        .reset_index(drop=True)
-    )
-
-    if not np.isfinite(
-        d[["open", "high", "low", "close", "volume"]].to_numpy()
-    ).all():
-        raise ValueError("Data contains NaN/infinity in price columns.")
-
-    if (d[["open", "high", "low", "close"]] <= 0).any().any():
-        raise ValueError("Data contains non-positive prices.")
-
-    if (d["high"] < d["low"]).any():
-        raise ValueError("Some candles have high < low.")
-
-    if (d["volume"] < 0).any():
-        raise ValueError("Data contains negative volume.")
-
-    # Gap detection (warning only)
-    diffs = d["open_time"].diff().dropna()
-    if len(diffs):
-        expected = diffs.median()
-        gap_count = int((diffs != expected).sum())
-    else:
-        gap_count = 0
-
-    # Datetime column for plotting
-    d["dt"] = pd.to_datetime(d["open_time"], unit="ms", utc=True)
-
-    return d, gap_count
-
-
-@st.cache_data(ttl=600, show_spinner="Fetching data...")
-def fetch_binance(symbol, interval, limit):
-    """
-    Fetch candles from Binance, trying multiple hosts in order.
-    Returns: (dataframe, gap count, host that succeeded)
+    Fetch raw klines, INCLUDING the currently-forming candle.
+    Returns: (dataframe, host_used)
     """
     errors = []
 
@@ -160,19 +110,31 @@ def fetch_binance(symbol, interval, limit):
                 response.json(), columns=KLINE_COLUMNS
             )
 
-            # Drop still-forming candles
-            now_ms = int(time.time() * 1000)
-            raw["close_time"] = pd.to_numeric(raw["close_time"])
-            raw = raw.loc[raw["close_time"] < now_ms]
+            for col in ["open_time", "close_time"]:
+                raw[col] = pd.to_numeric(
+                    raw[col], errors="raise"
+                ).astype("int64")
 
-            keep = [
-                "open_time", "open", "high", "low", "close",
+            for col in [
+                "open", "high", "low", "close",
                 "volume", "taker_buy_vol",
-            ]
-            df, gaps = validate_ohlcv(raw[keep].copy())
-            return df, gaps, host
+            ]:
+                raw[col] = pd.to_numeric(
+                    raw[col], errors="coerce"
+                ).astype(float)
 
-        except requests.RequestException as exc:
+            if not np.isfinite(
+                raw[["open", "high", "low", "close"]].to_numpy()
+            ).all():
+                raise ValueError("Non-finite price in klines.")
+
+            raw["dt"] = pd.to_datetime(
+                raw["open_time"], unit="ms", utc=True
+            )
+
+            return raw, host
+
+        except (requests.RequestException, ValueError) as exc:
             errors.append(f"{host} → {exc}")
 
     raise RuntimeError(
@@ -180,28 +142,131 @@ def fetch_binance(symbol, interval, limit):
     )
 
 
-@st.cache_data(show_spinner="Reading CSV...")
-def parse_csv(content):
-    df = pd.read_csv(io.BytesIO(content))
-    return validate_ohlcv(df)
+def fetch_server_time():
+    """Binance server time in ms. Falls back to local clock."""
+    for host in BINANCE_HOSTS:
+        try:
+            response = requests.get(
+                f"{host}/api/v3/time", timeout=5
+            )
+            response.raise_for_status()
+            return int(response.json()["serverTime"])
+        except (
+            requests.RequestException,
+            KeyError,
+            ValueError,
+        ):
+            continue
+    return int(time.time() * 1000)
 
 
 # =========================================================
-# STATISTICS UTILITIES
+# SESSION STATE
 # =========================================================
 
-def classify(ref_price, target_price, threshold):
-    """Classify direction based on FLAT threshold."""
-    change = target_price / ref_price - 1
-    if change > threshold:
-        return "UP", change
-    if change < -threshold:
-        return "DOWN", change
-    return "FLAT", change
+def init_state():
+    defaults = {
+        "predictions": [],
+        "last_render_ms": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
+
+init_state()
+
+
+# =========================================================
+# PREDICTION LOGIC
+# =========================================================
+
+def create_prediction(closed_df, interval_ms, horizon, predicted, threshold):
+    """
+    Anchor a prediction to the last CLOSED candle.
+    Reference price = close of the last closed candle.
+    Target = close of the candle at ref_open + horizon * interval.
+    """
+    last = closed_df.iloc[-1]
+    ref_open = int(last["open_time"])
+    ref_close_time = ref_open + interval_ms
+    ref_price = float(last["close"])
+
+    target_open = ref_open + horizon * interval_ms
+    target_close_time = target_open + interval_ms
+
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "created_at_ms": int(time.time() * 1000),
+        "ref_open": ref_open,
+        "ref_close_time": ref_close_time,
+        "ref_price": ref_price,
+        "horizon": horizon,
+        "interval_ms": interval_ms,
+        "target_open": target_open,
+        "target_close_time": target_close_time,
+        "predicted": predicted,
+        "threshold": threshold,
+        "settled": False,
+        "target_price": None,
+        "actual": None,
+        "change_pct": None,
+        "correct": None,
+        "settled_at_ms": None,
+    }
+
+
+def settle_predictions(predictions, closed_df, server_now_ms):
+    """
+    Try to settle pending predictions using data we already have.
+    Returns: (number settled this cycle, list of just-settled IDs)
+    """
+    lookup = {
+        int(row.open_time): float(row.close)
+        for row in closed_df.itertuples()
+    }
+    settled_count = 0
+    just_settled = []
+
+    for p in predictions:
+        if p["settled"]:
+            continue
+        # 2-second buffer to avoid racing a candle that closed
+        # microseconds ago
+        if server_now_ms < p["target_close_time"] + 2000:
+            continue
+
+        price = lookup.get(p["target_open"])
+        if price is None:
+            # Target candle not in visible window (offline too long);
+            # will be picked up when it appears in range.
+            continue
+
+        change = price / p["ref_price"] - 1
+        if change > p["threshold"]:
+            actual = "UP"
+        elif change < -p["threshold"]:
+            actual = "DOWN"
+        else:
+            actual = "FLAT"
+
+        p["target_price"] = price
+        p["actual"] = actual
+        p["change_pct"] = change * 100
+        p["correct"] = p["predicted"] == actual
+        p["settled"] = True
+        p["settled_at_ms"] = server_now_ms
+        settled_count += 1
+        just_settled.append(p["id"])
+
+    return settled_count, just_settled
+
+
+# =========================================================
+# STATISTICS
+# =========================================================
 
 def wilson_ci(k, n, z=1.96):
-    """95% Wilson confidence interval for a proportion."""
     if n == 0:
         return 0.0, 0.0
     p = k / n
@@ -218,86 +283,94 @@ def wilson_ci(k, n, z=1.96):
 # CHART
 # =========================================================
 
-def build_chart(visible, future=None, show_ma=True, show_taker=False):
-    n_rows = 3 if show_taker else 2
-    heights = [0.68, 0.16, 0.16] if show_taker else [0.78, 0.22]
-
+def build_live_chart(closed, forming, pending, show_ma=True):
     fig = make_subplots(
-        rows=n_rows, cols=1, shared_xaxes=True,
-        row_heights=heights, vertical_spacing=0.02,
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.78, 0.22], vertical_spacing=0.02,
     )
 
-    # Visible candles (past up to current position)
+    # Closed candles
     fig.add_trace(go.Candlestick(
-        x=visible["dt"],
-        open=visible["open"], high=visible["high"],
-        low=visible["low"], close=visible["close"],
+        x=closed["dt"],
+        open=closed["open"], high=closed["high"],
+        low=closed["low"], close=closed["close"],
         name="BTC/USDT",
         increasing_line_color="#26a69a",
         decreasing_line_color="#ef5350",
     ), row=1, col=1)
 
-    # Future candles (only after reveal), semi-transparent
-    if future is not None and len(future):
+    # Forming candle (live, semi-transparent)
+    if forming is not None and len(forming):
         fig.add_trace(go.Candlestick(
-            x=future["dt"],
-            open=future["open"], high=future["high"],
-            low=future["low"], close=future["close"],
-            name="Revealed outcome",
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-            opacity=0.45,
-            showlegend=True,
+            x=forming["dt"],
+            open=forming["open"], high=forming["high"],
+            low=forming["low"], close=forming["close"],
+            name="Forming (live)",
+            increasing_line_color="rgba(38,166,154,0.55)",
+            decreasing_line_color="rgba(239,83,80,0.55)",
+            increasing_fillcolor="rgba(38,166,154,0.35)",
+            decreasing_fillcolor="rgba(239,83,80,0.35)",
         ), row=1, col=1)
 
-        fig.add_vline(
-            x=future["dt"].iloc[0],
-            line_dash="dash", line_color="#ffd54f",
+    # Moving averages on closed candles only
+    if show_ma and len(closed) >= 20:
+        fig.add_trace(go.Scatter(
+            x=closed["dt"],
+            y=closed["close"].rolling(20).mean(),
+            mode="lines", name="MA20",
+            line=dict(width=1, color="#ffb74d"),
+        ), row=1, col=1)
+
+        if len(closed) >= 50:
+            fig.add_trace(go.Scatter(
+                x=closed["dt"],
+                y=closed["close"].rolling(50).mean(),
+                mode="lines", name="MA50",
+                line=dict(width=1, color="#42a5f5"),
+            ), row=1, col=1)
+
+    # Anchor lines for pending predictions
+    colors = {
+        "UP": "#26a69a",
+        "DOWN": "#ef5350",
+        "FLAT": "#9e9e9e",
+    }
+    for p in pending:
+        fig.add_hline(
+            y=p["ref_price"],
+            line_dash="dash",
+            line_color=colors.get(p["predicted"], "gray"),
+            annotation_text=(
+                f"{p['predicted']} @ {p['ref_price']:,.2f}"
+            ),
+            annotation_position="right",
             row=1, col=1,
         )
 
-    if show_ma:
-        ma20 = visible["close"].rolling(20).mean()
-        ma50 = visible["close"].rolling(50).mean()
-        fig.add_trace(go.Scatter(
-            x=visible["dt"], y=ma20, mode="lines",
-            name="MA20", line=dict(width=1, color="#ffb74d"),
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=visible["dt"], y=ma50, mode="lines",
-            name="MA50", line=dict(width=1, color="#42a5f5"),
-        ), row=1, col=1)
-
     # Volume
-    colors = np.where(
-        visible["close"] >= visible["open"],
+    vol_colors = np.where(
+        closed["close"] >= closed["open"],
         "#26a69a", "#ef5350",
     )
     fig.add_trace(go.Bar(
-        x=visible["dt"], y=visible["volume"],
-        marker_color=colors, name="Volume", showlegend=False,
+        x=closed["dt"], y=closed["volume"],
+        marker_color=vol_colors, name="Volume",
+        showlegend=False,
     ), row=2, col=1)
 
-    # Taker buy ratio (optional)
-    if show_taker and visible["taker_buy_vol"].notna().any():
-        ratio = (
-            visible["taker_buy_vol"]
-            / visible["volume"].replace(0, np.nan)
+    if forming is not None and len(forming):
+        f_colors = np.where(
+            forming["close"] >= forming["open"],
+            "rgba(38,166,154,0.55)", "rgba(239,83,80,0.55)",
         )
-        fig.add_trace(go.Scatter(
-            x=visible["dt"], y=ratio, mode="lines",
-            name="Taker buy ratio",
-            line=dict(width=1, color="#ab47bc"),
-        ), row=3, col=1)
-        fig.add_hline(
-            y=0.5, line_dash="dot", line_color="gray",
-            row=3, col=1,
-        )
-        fig.update_yaxes(title_text="Taker", row=3, col=1)
+        fig.add_trace(go.Bar(
+            x=forming["dt"], y=forming["volume"],
+            marker_color=f_colors, showlegend=False,
+        ), row=2, col=1)
 
     fig.update_layout(
         template="plotly_dark",
-        height=620,
+        height=560,
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", y=1.04),
@@ -309,236 +382,166 @@ def build_chart(visible, future=None, show_ma=True, show_taker=False):
 
 
 # =========================================================
-# SESSION STATE
+# SIDEBAR
 # =========================================================
 
-def init_state():
-    defaults = {
-        "idx": None,        # last visible candle index
-        "pending": None,    # locked prediction, not yet revealed
-        "reveal": None,     # (start_iloc, end_iloc) outcome candles
-        "history": [],      # prediction history
-        "data_id": None,    # active data source marker
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-init_state()
-
-
-# =========================================================
-# SIDEBAR: DATA SOURCE
-# =========================================================
-
-st.sidebar.title("📊 BTC/USDT Sim Lab")
-st.sidebar.caption("Replay real Binance candles for training.")
-
-source = st.sidebar.radio(
-    "Data source",
-    ["Fetch from Binance API", "Upload CSV"],
+st.sidebar.title("🟢 BTC/USDT Live Sim")
+st.sidebar.caption(
+    "Practice predictions against the live market."
 )
 
-df = None
-data_id = None
+symbol = st.sidebar.text_input(
+    "Symbol", value="BTCUSDT"
+).upper()
 
-if source == "Fetch from Binance API":
-    symbol = st.sidebar.text_input(
-        "Symbol", value="BTCUSDT"
-    ).upper()
-    interval = st.sidebar.selectbox(
-        "Interval", ["1m", "5m", "15m", "1h"], index=0
-    )
-    limit = st.sidebar.slider(
-        "Number of candles", 500, 1500, 1000, step=100
-    )
-
-    if st.sidebar.button("🔄 Fetch data", use_container_width=True):
-        try:
-            df_new, gaps, host = fetch_binance(
-                symbol, interval, limit
-            )
-            st.session_state["_data"] = df_new
-            st.session_state["_gaps"] = gaps
-            st.session_state["_host"] = host
-            st.session_state["_data_id"] = (
-                f"{symbol}-{interval}-{limit}"
-            )
-        except (requests.RequestException, RuntimeError) as e:
-            st.sidebar.error(f"Fetch failed: {e}")
-            st.sidebar.caption(
-                "If all hosts fail, switch to CSV upload mode."
-            )
-
-    current_id = st.session_state.get("_data_id", "")
-
-    if (
-        "_data" in st.session_state
-        and current_id.startswith(f"{symbol}-{interval}")
-    ):
-        df = st.session_state["_data"]
-        data_id = current_id
-
-        host_used = st.session_state.get("_host", "?")
-        st.sidebar.caption(f"Host: {host_used}")
-
-        if ".us" in host_used:
-            st.sidebar.caption(
-                "Note: data from Binance.US — thinner liquidity "
-                "than Binance.com global."
-            )
-    else:
-        st.info("Click **Fetch data** in the sidebar to start.")
-
-else:
-    uploaded = st.sidebar.file_uploader(
-        "Upload CSV (Binance klines format)", type=["csv"]
-    )
-    st.sidebar.caption(
-        "Required columns: open_time, open, high, low, close, volume. "
-        "Your BTCUSDT_1m_50k.csv works as-is."
-    )
-
-    if uploaded is not None:
-        try:
-            df, gaps = parse_csv(uploaded.getvalue())
-            st.session_state["_gaps"] = gaps
-            data_id = f"csv-{uploaded.name}-{uploaded.size}"
-        except Exception as e:
-            st.sidebar.error(f"Invalid CSV: {e}")
-
-# Reset position when data source changes
-if df is not None and data_id != st.session_state.data_id:
-    st.session_state.data_id = data_id
-    st.session_state.idx = min(200, len(df) - 20)
-    st.session_state.pending = None
-    st.session_state.reveal = None
-    st.session_state.history = []
-
-if df is None:
-    st.title("📊 BTC/USDT Market Simulation Lab")
-    st.write(
-        "Choose a data source in the sidebar to start. "
-        "Future candles will be hidden — your job is to guess the direction."
-    )
-    st.stop()
-
-if st.session_state.get("_gaps", 0) > 0:
-    st.warning(
-        f"Data contains {st.session_state['_gaps']} candle gaps. "
-        "Note: time jumps can affect how you read the chart."
-    )
-
-
-# =========================================================
-# SIDEBAR: SETTINGS
-# =========================================================
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Settings")
-
-window = st.sidebar.slider(
-    "Candles shown on chart", 30, 300, 100, step=10
+interval = st.sidebar.selectbox(
+    "Candle interval", ["1m", "5m", "15m"], index=0
 )
+interval_ms = interval_to_ms(interval)
+
+chart_window = st.sidebar.slider(
+    "Candles shown on chart", 50, 300, 120, step=10
+)
+
 horizon = st.sidebar.selectbox(
     "Prediction horizon (candles)", [1, 3, 5, 15], index=2
 )
+
 threshold_pct = st.sidebar.number_input(
-    "FLAT threshold (%)", min_value=0.0, max_value=1.0,
+    "FLAT threshold (%)",
+    min_value=0.0, max_value=2.0,
     value=0.03, step=0.01,
+    format="%.2f",
 )
 threshold = threshold_pct / 100
 
-show_ma = st.sidebar.checkbox("Show MA20/MA50", value=True)
-show_taker = st.sidebar.checkbox("Show taker buy ratio", value=False)
-
-autoplay = st.sidebar.toggle("Auto-play", value=False)
-speed = st.sidebar.select_slider(
-    "Auto-play speed", options=[0.5, 1, 2, 5, 10], value=2
+refresh_seconds = st.sidebar.slider(
+    "Auto-refresh (seconds)", 5, 60, 10, step=5
 )
 
-max_idx = len(df) - 1
-if st.session_state.idx is None:
-    st.session_state.idx = min(200, max_idx - horizon - 1)
-
-idx = int(np.clip(st.session_state.idx, window, max_idx))
-st.session_state.idx = idx
-
-locked = st.session_state.pending is not None
-
-
-# =========================================================
-# SIDEBAR: NAVIGATION
-# =========================================================
+show_ma = st.sidebar.checkbox("Show MA20 / MA50", value=True)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Navigation")
+st.sidebar.subheader("Actions")
 
-nav1 = st.sidebar.columns(3)
-nav2 = st.sidebar.columns(3)
-
-
-def move(step):
-    st.session_state.idx = int(
-        np.clip(st.session_state.idx + step, window, max_idx)
-    )
-    st.session_state.pending = None
-    st.session_state.reveal = None
-
-
-if nav1[0].button("⏪ -100", disabled=locked, use_container_width=True):
-    move(-100)
-    st.rerun()
-if nav1[1].button("◀ -10", disabled=locked, use_container_width=True):
-    move(-10)
-    st.rerun()
-if nav1[2].button("-1", disabled=locked, use_container_width=True):
-    move(-1)
-    st.rerun()
-if nav2[0].button("+1", disabled=locked, use_container_width=True):
-    move(1)
-    st.rerun()
-if nav2[1].button("+10 ▶", disabled=locked, use_container_width=True):
-    move(10)
-    st.rerun()
-if nav2[2].button("+100 ⏩", disabled=locked, use_container_width=True):
-    move(100)
+if st.sidebar.button("🧹 Clear pending predictions"):
+    st.session_state.predictions = [
+        p for p in st.session_state.predictions if p["settled"]
+    ]
     st.rerun()
 
-if st.sidebar.button(
-    "🎲 Random position", disabled=locked, use_container_width=True
-):
-    st.session_state.idx = int(
-        np.random.randint(window, max_idx - horizon - 1)
-    )
-    st.session_state.pending = None
-    st.session_state.reveal = None
+if st.sidebar.button("🗑️ Clear all history"):
+    st.session_state.predictions = []
     st.rerun()
 
 
 # =========================================================
-# MAIN PANEL: INFO + CHART
+# AUTO-REFRESH
 # =========================================================
 
-visible = df.iloc[max(0, idx - window):idx + 1]
-future = None
-if st.session_state.reveal is not None:
-    s, e = st.session_state.reveal
-    future = df.iloc[s:e]
-
-last = visible.iloc[-1]
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Candle time", last["dt"].strftime("%Y-%m-%d %H:%M UTC"))
-c2.metric("Close", f"${last['close']:,.2f}")
-c3.metric("Position", f"{idx:,} / {len(df):,}")
-c4.metric(
-    "Hidden candles remaining",
-    f"{len(df) - idx - 1:,}",
+st_autorefresh(
+    interval=refresh_seconds * 1000,
+    key="live_autorefresh",
 )
 
-fig = build_chart(visible, future, show_ma, show_taker)
+
+# =========================================================
+# FETCH LIVE DATA
+# =========================================================
+
+try:
+    raw, host_used = fetch_klines(
+        symbol, interval, limit=999
+    )
+    server_now_ms = fetch_server_time()
+except RuntimeError as exc:
+    st.error(f"Data fetch failed: {exc}")
+    st.stop()
+
+is_closed = raw["close_time"] < server_now_ms
+
+closed = (
+    raw.loc[is_closed]
+    .reset_index(drop=True)
+)
+forming = (
+    raw.loc[~is_closed]
+    .reset_index(drop=True)
+)
+
+if len(closed) < 10:
+    st.error("Not enough closed candles yet.")
+    st.stop()
+
+# Settle anything that has matured
+settled_now, just_settled_ids = settle_predictions(
+    st.session_state.predictions,
+    closed,
+    server_now_ms,
+)
+
+
+# =========================================================
+# HEADER
+# =========================================================
+
+live_price = float(forming.iloc[-1]["close"]) if len(forming) else float(closed.iloc[-1]["close"])
+last_closed = closed.iloc[-1]
+next_close_ms = int(forming.iloc[-1]["close_time"]) + 1 if len(forming) else int(last_closed["close_time"]) + 1
+seconds_to_close = max(0, (next_close_ms - server_now_ms) / 1000)
+
+pending_count = sum(
+    1 for p in st.session_state.predictions if not p["settled"]
+)
+settled_count = sum(
+    1 for p in st.session_state.predictions if p["settled"]
+)
+
+h1, h2, h3, h4 = st.columns(4)
+h1.metric(
+    "Server time",
+    utc_short(server_now_ms) + " UTC",
+)
+h2.metric(
+    "Live price",
+    f"${live_price:,.2f}",
+)
+h3.metric(
+    "Next candle close",
+    f"{seconds_to_close:.0f}s",
+)
+h4.metric(
+    "Pending / Settled",
+    f"{pending_count} / {settled_count}",
+)
+
+st.caption(
+    f"Data host: `{host_used}` | "
+    f"Interval: `{interval}` | "
+    f"Auto-refresh every {refresh_seconds}s"
+)
+
+
+# =========================================================
+# CHART
+# =========================================================
+
+chart_start = max(0, len(closed) - chart_window)
+visible_closed = closed.iloc[chart_start:]
+
+pending = [
+    p for p in st.session_state.predictions if not p["settled"]
+]
+recent_settled = [
+    p for p in st.session_state.predictions if p["settled"]
+][-5:]
+
+fig = build_live_chart(
+    visible_closed,
+    forming,
+    pending,
+    show_ma=show_ma,
+)
 st.plotly_chart(fig, use_container_width=True)
 
 
@@ -546,196 +549,211 @@ st.plotly_chart(fig, use_container_width=True)
 # PREDICTION PANEL
 # =========================================================
 
-st.subheader("🎯 Prediction practice")
+st.subheader("🎯 Make a prediction")
 
-can_predict = idx + horizon < len(df)
+st.write(
+    f"Anchor: **close of the last closed candle** "
+    f"(`{utc_str(int(last_closed['open_time']) + interval_ms)}`) "
+    f"@ **${last_closed['close']:,.2f}**\n\n"
+    f"Horizon: **{horizon} × {interval}**. "
+    f"FLAT if change within ±{threshold_pct:.2f}%."
+)
 
-if not can_predict:
-    st.info("Already at the end of data — not enough candles to reveal.")
+b1, b2, b3 = st.columns(3)
+pred_up = b1.button("📈 UP", use_container_width=True)
+pred_flat = b2.button("➡️ FLAT", use_container_width=True)
+pred_down = b3.button("📉 DOWN", use_container_width=True)
 
-if st.session_state.pending is None:
-    st.write(
-        f"Guess the direction **{horizon} candle(s) ahead** "
-        f"(FLAT if within ±{threshold_pct:.2f}%):"
+clicked = (
+    "UP" if pred_up else
+    "FLAT" if pred_flat else
+    "DOWN" if pred_down else None
+)
+
+if clicked:
+    # Avoid two predictions on the same reference candle
+    last_ref_open = int(last_closed["open_time"])
+    already = any(
+        p["ref_open"] == last_ref_open
+        for p in st.session_state.predictions
     )
-
-    b1, b2, b3 = st.columns(3)
-    pred_up = b1.button(
-        "📈 UP", disabled=not can_predict, use_container_width=True
-    )
-    pred_flat = b2.button(
-        "➡️ FLAT", disabled=not can_predict, use_container_width=True
-    )
-    pred_down = b3.button(
-        "📉 DOWN", disabled=not can_predict, use_container_width=True
-    )
-
-    chosen = (
-        "UP" if pred_up else
-        "FLAT" if pred_flat else
-        "DOWN" if pred_down else None
-    )
-
-    if chosen:
-        st.session_state.pending = {
-            "pred": chosen,
-            "ref_idx": idx,
-            "ref_price": float(last["close"]),
-            "ref_time": str(last["dt"]),
-        }
-        st.rerun()
-
-else:
-    pending = st.session_state.pending
-    st.write(
-        f"Locked prediction: **{pending['pred']}** "
-        f"@ ${pending['ref_price']:,.2f} ({pending['ref_time']})"
-    )
-
-    if st.session_state.reveal is None:
-        if st.button("🔓 Reveal outcome", type="primary"):
-            s = pending["ref_idx"] + 1
-            e = s + horizon
-            target_price = float(df.iloc[e - 1]["close"])
-
-            actual, change = classify(
-                pending["ref_price"], target_price, threshold
-            )
-
-            st.session_state.history.append({
-                "time": pending["ref_time"],
-                "ref_price": pending["ref_price"],
-                "target_price": target_price,
-                "change_pct": change * 100,
-                "pred": pending["pred"],
-                "actual": actual,
-                "correct": pending["pred"] == actual,
-            })
-
-            st.session_state.reveal = (s, e)
-            st.rerun()
-
-    else:
-        record = st.session_state.history[-1]
-
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Target price", f"${record['target_price']:,.2f}")
-        r2.metric("Change", f"{record['change_pct']:+.3f}%")
-        r3.metric("Actual", record["actual"])
-        r4.metric(
-            "Result",
-            "✅ Correct" if record["correct"] else "❌ Wrong",
+    if already:
+        st.warning(
+            "You already predicted on this reference candle."
         )
-
-        if st.button("➡️ Continue", type="primary"):
-            # Jump by horizon so windows do not overlap
-            st.session_state.idx = min(
-                pending["ref_idx"] + horizon, max_idx
-            )
-            st.session_state.pending = None
-            st.session_state.reveal = None
-            st.rerun()
+    else:
+        new_pred = create_prediction(
+            closed, interval_ms, horizon, clicked, threshold
+        )
+        st.session_state.predictions.append(new_pred)
+        st.toast(
+            f"Locked: {clicked} @ ${new_pred['ref_price']:,.2f}",
+            icon="✅",
+        )
+        st.rerun()
 
 
 # =========================================================
-# STATISTICS
+# PENDING PREDICTIONS
 # =========================================================
 
 st.markdown("---")
-st.subheader("📈 Training statistics")
+st.subheader("⏳ Pending predictions")
 
-history = st.session_state.history
+pending = [
+    p for p in st.session_state.predictions if not p["settled"]
+]
 
-if not history:
+if not pending:
     st.caption(
-        "No predictions yet. Statistics appear after your first prediction."
+        "No pending predictions. Use the buttons above to anchor one."
     )
 else:
-    h = pd.DataFrame(history)
-    n = len(h)
-    k = int(h["correct"].sum())
+    pending_sorted = sorted(
+        pending, key=lambda p: p["target_close_time"]
+    )
+    rows = []
+    for p in pending_sorted:
+        remaining = max(
+            0, (p["target_close_time"] - server_now_ms) / 1000
+        )
+        rows.append({
+            "Ref time": utc_short(p["ref_close_time"]),
+            "Horizon": p["horizon"],
+            "Predicted": p["predicted"],
+            "Reference": f"${p['ref_price']:,.2f}",
+            "Settles in": f"{remaining:.0f}s",
+        })
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# =========================================================
+# SETTLED HISTORY + STATS
+# =========================================================
+
+st.markdown("---")
+st.subheader("📈 Settled history and statistics")
+
+settled = [
+    p for p in st.session_state.predictions if p["settled"]
+]
+
+if not settled:
+    st.caption(
+        "No settled predictions yet. "
+        "Wait for the horizon to elapse."
+    )
+else:
+    n = len(settled)
+    k = sum(1 for p in settled if p["correct"])
     acc = k / n
     lo, hi = wilson_ci(k, n)
 
-    majority_baseline = h["actual"].value_counts(
-        normalize=True
-    ).max()
+    # Majority baseline
+    from collections import Counter
+    actual_counts = Counter(p["actual"] for p in settled)
+    majority_baseline = max(actual_counts.values()) / n
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Total predictions", n)
+    s1.metric("Settled", n)
     s2.metric("Your accuracy", f"{acc:.1%}")
     s3.metric("95% CI", f"{lo:.1%} – {hi:.1%}")
     s4.metric(
         "Majority baseline",
         f"{majority_baseline:.1%}",
         help=(
-            "Accuracy if you always guessed the most frequent class."
+            "Accuracy if you always guessed the most frequent "
+            "outcome so far."
         ),
     )
 
     if n < 30:
         st.caption(
-            "⚠️ Sample still small (<30). Do not draw conclusions yet — "
-            "the confidence interval is still very wide."
+            "⚠️ Sample still small (<30). Do not draw conclusions — "
+            "confidence interval is very wide."
         )
     elif lo > majority_baseline:
         st.success(
             "Your CI lower bound is above the majority baseline. "
-            "This is an early positive sign — but it still does not "
-            "account for fees/slippage/payout if used for trading."
+            "Early positive sign — but still does not account for "
+            "fees/slippage/payout if used for trading."
         )
     else:
         st.caption(
-            "Your accuracy has not yet been proven to beat the simple "
-            "baseline. That is normal — and that is the point of the drill."
+            "Not yet proven to beat the simple baseline. "
+            "That is normal — and that is the point of the drill."
         )
 
-    t1, t2 = st.columns(2)
+    # Table of settled predictions, newest first
+    rows = []
+    for p in reversed(settled):
+        rows.append({
+            "Ref time": utc_str(p["ref_close_time"]),
+            "Predicted": p["predicted"],
+            "Reference": f"${p['ref_price']:,.2f}",
+            "Target": f"${p['target_price']:,.2f}",
+            "Change": f"{p['change_pct']:+.3f}%",
+            "Actual": p["actual"],
+            "Result": "✅" if p["correct"] else "❌",
+        })
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    with t1:
-        st.write("**Accuracy by predicted class:**")
-        per_pred = (
-            h.groupby("pred")["correct"]
-            .agg(["count", "mean"])
-            .rename(columns={"count": "count", "mean": "accuracy"})
+    # Accuracy by predicted direction
+    st.write("**Accuracy by predicted direction:**")
+    breakdown = {}
+    for p in settled:
+        d = breakdown.setdefault(
+            p["predicted"], {"count": 0, "correct": 0}
         )
-        per_pred["accuracy"] = per_pred["accuracy"].map(
-            "{:.1%}".format
-        )
-        st.dataframe(per_pred, use_container_width=True)
+        d["count"] += 1
+        if p["correct"]:
+            d["correct"] += 1
 
-    with t2:
-        st.write("**Predicted vs actual:**")
-        crosstab = pd.crosstab(
-            h["pred"], h["actual"],
-            margins=True, margins_name="Total",
-        )
-        st.dataframe(crosstab, use_container_width=True)
+    bd_rows = []
+    for direction, d in breakdown.items():
+        bd_rows.append({
+            "Direction": direction,
+            "Count": d["count"],
+            "Correct": d["correct"],
+            "Accuracy": f"{d['correct'] / d['count']:.1%}",
+        })
+    st.dataframe(
+        pd.DataFrame(bd_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.write("**Cumulative accuracy:**")
-    h["cum_acc"] = h["correct"].expanding().mean()
-    st.line_chart(h["cum_acc"])
-
-    d1, d2 = st.columns(2)
-    d1.download_button(
-        "💾 Download history (CSV)",
-        h.drop(columns=["cum_acc"]).to_csv(index=False),
-        "prediction_history.csv",
+    # Download
+    export_rows = []
+    for p in settled:
+        export_rows.append({
+            "ref_close_utc": utc_str(p["ref_close_time"]),
+            "created_at_ms": p["created_at_ms"],
+            "settled_at_ms": p["settled_at_ms"],
+            "horizon": p["horizon"],
+            "interval_ms": p["interval_ms"],
+            "ref_price": p["ref_price"],
+            "target_price": p["target_price"],
+            "change_pct": p["change_pct"],
+            "predicted": p["predicted"],
+            "actual": p["actual"],
+            "correct": p["correct"],
+            "threshold": p["threshold"],
+        })
+    st.download_button(
+        "💾 Download settled history (CSV)",
+        pd.DataFrame(export_rows).to_csv(index=False),
+        "live_prediction_history.csv",
         "text/csv",
     )
-    if d2.button("🗑️ Reset statistics"):
-        st.session_state.history = []
-        st.rerun()
-
-
-# =========================================================
-# AUTO-PLAY
-# =========================================================
-
-if autoplay and not locked and idx < max_idx:
-    time.sleep(1 / speed)
-    st.session_state.idx = idx + 1
-    st.rerun()
 
 
 # =========================================================
@@ -743,9 +761,9 @@ if autoplay and not locked and idx < max_idx:
 # =========================================================
 
 st.caption(
-    "Data: Binance public API / your own CSV. "
+    "Live data from Binance public API. "
     "This tool is for practicing price-action reading — "
-    "it is not a signal, and it does not promise profit. "
-    "Accuracy here is not profit, because fees, spread, slippage, "
-    "and payout are not modeled."
+    "not a signal, and it does not promise profit. "
+    "Settlement uses close-to-close, so it is not the same as "
+    "an executable entry/exit price."
 )
